@@ -1,0 +1,504 @@
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ===== MEGA PINS =====
+
+const byte STEP_PIN = 22;
+const byte DIR_PIN  = 23;
+const byte EN_PIN   = 24;
+
+const byte LIMIT_PIN = 25;
+
+const byte GREEN_LED  = 26;
+const byte YELLOW_LED = 27;
+const byte RED_LED    = 28;
+
+// Unused yaw driver: prevent uncommanded steps
+const byte YAW_STEP = 3;
+const byte YAW_DIR  = 4;
+const byte YAW_EN   = 5;
+
+// ===== CARRIAGE SETTINGS =====
+
+const bool POSITIVE_DIR_HIGH = true;
+
+// 1605 ballscrew: 5 mm/revolution
+// 200 full steps/revolution
+// 1/8 microstepping = 1600 steps/revolution
+
+const float STEPS_PER_MM = 320.0f;
+const long TRAVEL_STEPS = 24384L;  // Exactly 3 inches
+
+// 12 seconds each direction
+const unsigned long HALF_TIME_US = 12000000UL;
+
+// Minimum time between pulses
+const unsigned long MIN_STEP_US = 250UL;
+
+// ===== OPTIONAL LIMIT SWITCH =====
+
+const bool USE_LIMIT_SWITCH = false;
+const bool AUTO_BACKOFF = false;
+
+// Must physically move AWAY from the switch
+const int BACKOFF_DIRECTION = +1;
+
+const unsigned long BACKOFF_STEP_US = 3500UL;
+const long MAX_BACKOFF_STEPS = 1600L; // 5 mm
+
+// ===== STATE =====
+
+enum Mode {
+  IDLE,
+  MOVING,
+  RECOVERY,
+  FAULT
+};
+
+Mode mode = IDLE;
+
+long positionSteps = 0;
+long targetSteps = 0;
+
+long totalSteps = 0;
+long completedSteps = 0;
+
+int moveDirection = 1;
+
+bool autoMode = false;
+bool calibrated = false;
+bool jogMode = false;
+
+unsigned long moveStart = 0;
+unsigned long moveDuration = 0;
+unsigned long nextStepTime = 0;
+unsigned long lastPulse = 0;
+
+long recoverySteps = 0;
+unsigned long releaseTime = 0;
+
+char command[32];
+byte commandLength = 0;
+
+// ===== HARDWARE =====
+
+void enableMotor(bool enabled) {
+  // A4988: LOW = enabled
+  digitalWrite(EN_PIN, enabled ? LOW : HIGH);
+}
+
+bool limitActive() {
+  if (!USE_LIMIT_SWITCH) return false;
+
+  // NC switch, COM -> GND, NC -> D25
+  // HIGH = pressed or disconnected
+  return digitalRead(LIMIT_PIN) == HIGH;
+}
+
+void updateLEDs() {
+  digitalWrite(GREEN_LED,
+    mode == MOVING ? HIGH : LOW);
+
+  digitalWrite(YELLOW_LED,
+    mode == IDLE ? HIGH : LOW);
+
+  digitalWrite(RED_LED,
+    (mode == FAULT || mode == RECOVERY) ? HIGH : LOW);
+}
+
+void stepMotor(int direction) {
+  bool dirHigh =
+    (direction > 0) == POSITIVE_DIR_HIGH;
+
+  digitalWrite(DIR_PIN, dirHigh ? HIGH : LOW);
+  delayMicroseconds(4);
+
+  digitalWrite(STEP_PIN, HIGH);
+  delayMicroseconds(4);
+  digitalWrite(STEP_PIN, LOW);
+
+  positionSteps += direction;
+  lastPulse = micros();
+}
+
+void stopMotor() {
+  enableMotor(false);
+  mode = IDLE;
+  autoMode = false;
+
+  // Disabled motor can lose its reference position.
+  calibrated = false;
+}
+
+void setFault(const char* reason) {
+  enableMotor(false);
+
+  mode = FAULT;
+  autoMode = false;
+  calibrated = false;
+
+  Serial.print("FAULT: ");
+  Serial.println(reason);
+}
+
+// ===== SINUSOIDAL STEP SCHEDULING =====
+
+// Calculate when the next microstep should occur.
+// Cosine position profile gives sinusoidal velocity.
+//
+// Position fraction:
+// x(t) = (1 - cos(PI*t/T)) / 2
+//
+// Inverse gives the timestamp for each microstep.
+
+void scheduleNextStep() {
+  if (completedSteps >= totalSteps) return;
+
+  float fraction =
+    (float)(completedSteps + 1) / (float)totalSteps;
+
+  float phase =
+    acosf(1.0f - 2.0f * fraction) / PI;
+
+  unsigned long offset =
+    (unsigned long)(phase * moveDuration);
+
+  nextStepTime = moveStart + offset;
+}
+
+// ===== START MOVEMENT =====
+
+void startMove(long destination, bool automatic,
+               bool jogging = false) {
+
+  if (destination == positionSteps) {
+    Serial.println("Already at target");
+    return;
+  }
+
+  targetSteps = destination;
+
+  moveDirection =
+    (destination > positionSteps) ? +1 : -1;
+
+  totalSteps = labs(destination - positionSteps);
+  completedSteps = 0;
+
+  autoMode = automatic;
+  jogMode = jogging;
+
+  // Proportional duration for partial movements
+  moveDuration =
+    (unsigned long)(
+      (uint64_t)HALF_TIME_US * totalSteps /
+      TRAVEL_STEPS
+    );
+
+  // Prevent short jogs from accelerating too rapidly
+  if (moveDuration < 1500000UL) {
+    moveDuration = 1500000UL;
+  }
+
+  enableMotor(true);
+  delay(5);
+
+  moveStart = micros();
+  lastPulse = moveStart;
+
+  mode = MOVING;
+
+  scheduleNextStep();
+}
+
+// ===== MOTION LOOP =====
+
+void updateMotion() {
+  unsigned long now = micros();
+
+  // Signed comparison handles micros() rollover.
+  if ((int32_t)(now - nextStepTime) < 0) return;
+
+  if ((unsigned long)(now - lastPulse) < MIN_STEP_US) {
+    return;
+  }
+
+  stepMotor(moveDirection);
+  completedSteps++;
+
+  if (completedSteps >= totalSteps) {
+
+    positionSteps = targetSteps;
+
+    if (autoMode) {
+      // Reverse smoothly at either end
+      long nextTarget =
+        targetSteps == TRAVEL_STEPS ? 0 : TRAVEL_STEPS;
+
+      startMove(nextTarget, true);
+    }
+    else {
+      bool wasJog = jogMode;
+
+      mode = IDLE;
+      enableMotor(false);
+
+      if (wasJog) {
+        calibrated = false;
+      }
+
+      Serial.println("Movement complete");
+    }
+
+    return;
+  }
+
+  scheduleNextStep();
+}
+
+// ===== OPTIONAL SWITCH RECOVERY =====
+
+void beginRecovery() {
+  autoMode = false;
+  calibrated = false;
+  mode = RECOVERY;
+
+  recoverySteps = 0;
+  releaseTime = 0;
+  lastPulse = micros();
+
+  enableMotor(true);
+
+  Serial.println("LIMIT HIT - RETREATING");
+}
+
+void updateRecovery() {
+
+  if (!limitActive()) {
+
+    if (releaseTime == 0) {
+      releaseTime = millis();
+    }
+
+    if (millis() - releaseTime >= 30) {
+      setFault("Limit released; recalibrate");
+    }
+
+    return;
+  }
+
+  releaseTime = 0;
+
+  if (recoverySteps >= MAX_BACKOFF_STEPS) {
+    setFault("Switch did not release");
+    return;
+  }
+
+  if (micros() - lastPulse >= BACKOFF_STEP_US) {
+    stepMotor(BACKOFF_DIRECTION);
+    recoverySteps++;
+  }
+}
+
+// ===== SERIAL COMMANDS =====
+
+void handleCommand(char* cmd) {
+
+  // Emergency software stop
+  if (strcmp(cmd, "p") == 0 ||
+      strcmp(cmd, "x") == 0) {
+
+    stopMotor();
+    Serial.println("STOPPED - re-zero before resuming");
+    return;
+  }
+
+  // Status
+  if (strcmp(cmd, "s") == 0) {
+    Serial.print("Position: ");
+    Serial.print(positionSteps / STEPS_PER_MM, 2);
+    Serial.println(" mm (estimated)");
+
+    Serial.print("Calibrated: ");
+    Serial.println(calibrated ? "YES" : "NO");
+    return;
+  }
+
+  // Clear a resolved fault
+  if (strcmp(cmd, "c") == 0) {
+    if (mode == FAULT && !limitActive()) {
+      mode = IDLE;
+      calibrated = false;
+      Serial.println("Fault cleared; use z");
+    }
+    return;
+  }
+
+  // Software zero
+  if (strcmp(cmd, "z") == 0) {
+    if (mode != IDLE || limitActive()) {
+      Serial.println("Cannot zero now");
+      return;
+    }
+
+    positionSteps = 0;
+    calibrated = true;
+
+    Serial.println("ZERO SET");
+    return;
+  }
+
+  // Manual jog, in millimeters
+  if (strncmp(cmd, "j ", 2) == 0) {
+
+    if (mode != IDLE || limitActive()) return;
+
+    char* endPtr;
+    float mm = strtod(cmd + 2, &endPtr);
+
+    if (endPtr == cmd + 2 ||
+        *endPtr != '\0' ||
+        !isfinite(mm) ||
+        mm == 0 ||
+        fabs(mm) > 10.0f) {
+
+      Serial.println("Use j 2 or j -2; max 10 mm");
+      return;
+    }
+
+    long steps = lroundf(mm * STEPS_PER_MM);
+
+    if (steps == 0) return;
+
+    startMove(positionSteps + steps, false, true);
+
+    Serial.print("Jogging ");
+    Serial.print(mm);
+    Serial.println(" mm");
+
+    return;
+  }
+
+  // All automatic commands require a valid zero
+  if (mode != IDLE || !calibrated || limitActive()) {
+    Serial.println("Cannot start; check state and use z");
+    return;
+  }
+
+  // Forward to 3-inch endpoint
+  if (strcmp(cmd, "f") == 0) {
+    startMove(TRAVEL_STEPS, false);
+    Serial.println("FORWARD");
+    return;
+  }
+
+  // Back to zero
+  if (strcmp(cmd, "b") == 0) {
+    startMove(0, false);
+    Serial.println("BACKWARD");
+    return;
+  }
+
+  // Continuous automatic sweep
+  if (strcmp(cmd, "a") == 0 ||
+      strcmp(cmd, "g") == 0) {
+
+    long destination =
+      positionSteps == TRAVEL_STEPS ? 0 : TRAVEL_STEPS;
+
+    startMove(destination, true);
+
+    Serial.println("AUTO SWEEP");
+    return;
+  }
+
+  Serial.println("Commands: z, f, b, a, j 2, j -2, p, s, c");
+}
+
+// ===== SETUP =====
+
+void setup() {
+
+  // Keep unused gearbox yaw driver disabled
+  digitalWrite(YAW_EN, HIGH);
+  pinMode(YAW_EN, OUTPUT);
+
+  digitalWrite(YAW_STEP, LOW);
+  pinMode(YAW_STEP, OUTPUT);
+
+  digitalWrite(YAW_DIR, LOW);
+  pinMode(YAW_DIR, OUTPUT);
+
+  // Carriage driver disabled at startup
+  digitalWrite(EN_PIN, HIGH);
+  pinMode(EN_PIN, OUTPUT);
+
+  digitalWrite(STEP_PIN, LOW);
+  pinMode(STEP_PIN, OUTPUT);
+
+  digitalWrite(DIR_PIN, LOW);
+  pinMode(DIR_PIN, OUTPUT);
+
+  pinMode(LIMIT_PIN, INPUT_PULLUP);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  updateLEDs();
+
+  Serial.begin(115200);
+
+  Serial.println("CARRIAGE READY");
+  Serial.println("3 inches / 1:8 microstepping");
+  Serial.println("12 seconds per direction");
+  Serial.println("z = set current position as zero");
+  Serial.println("f = forward, b = backward");
+  Serial.println("a = automatic sinusoidal sweep");
+  Serial.println("j 2 / j -2 = manual jog");
+  Serial.println("p = stop, s = status");
+}
+
+// ===== MAIN LOOP =====
+
+void loop() {
+
+  while (Serial.available()) {
+
+    char ch = Serial.read();
+
+    if (ch == '\n' || ch == '\r') {
+
+      if (commandLength > 0) {
+        command[commandLength] = '\0';
+        handleCommand(command);
+        commandLength = 0;
+      }
+
+    } else if (commandLength < sizeof(command) - 1) {
+      command[commandLength++] = ch;
+    }
+  }
+
+  if (USE_LIMIT_SWITCH &&
+      mode != FAULT &&
+      mode != RECOVERY &&
+      limitActive()) {
+
+    if (AUTO_BACKOFF && mode == MOVING) {
+      beginRecovery();
+    } else {
+      setFault("Limit switch active");
+    }
+  }
+
+  if (mode == MOVING) {
+    updateMotion();
+  }
+  else if (mode == RECOVERY) {
+    updateRecovery();
+  }
+
+  updateLEDs();
+}
